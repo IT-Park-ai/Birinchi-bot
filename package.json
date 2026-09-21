@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {
   "name": "ai-telegram-bot-gemini",
   "version": "1.0.0",
@@ -10,4 +11,17 @@
     "@google/genai": "^1.0.0",
     "grammy": "^1.30.0"
   }
+=======
+{
+  "name": "ai-telegram-bot-gemini",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env bot.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "grammy": "^1.30.0"
+  }
+>>>>>>> 4a2f54fdf4cd6c483ff11282cd3d565799faab6b
 }
