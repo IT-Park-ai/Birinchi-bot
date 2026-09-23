@@ -1,6 +1,11 @@
-import { Bot } from "grammy";
+import { Bot, InputFile } from "grammy";
 import { GoogleGenAI } from "@google/genai";
 import http from "node:http";
+import { PassThrough } from "node:stream";
+import ffmpegPath from "ffmpeg-static";
+import ffmpeg from "fluent-ffmpeg";
+
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 // Render "Web Service" turi portni kutadi. Botning o'ziga bu shart emas,
 // shuning uchun shu kichik server faqat Render'ni qanoatlantirish uchun.
@@ -13,9 +18,14 @@ const bot = new Bot(process.env.BOT_TOKEN);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const MODEL = process.env.MODEL || "gemini-3.6-flash";
+// TTS (ovoz sintezi) uchun alohida model. AI Studio'da hozirgi nomini tekshiring.
+const TTS_MODEL = process.env.TTS_MODEL || "gemini-2.5-flash-preview-tts";
+// Tayyor ovozlardan biri: Kore, Puck, Charon, Fenrir, Aoede va h.k.
+const VOICE_NAME = process.env.VOICE_NAME || "Kore";
+
 const MAX_HISTORY = 20;
 const SYSTEM_PROMPT = `Sen Telegramdagi do'stona va aqlli AI yordamchisan.
-Foydalanuvchi qaysi tilda yozsa, o'sha tilda (asosan o'zbek tilida) javob ber.
+Foydalanuvchi qaysi tilda yozsa yoki gapirsa, o'sha tilda (asosan o'zbek tilida) javob ber.
 Javob qoidalari:
 - Qisqa, aniq va tushunarli yoz. Ortiqcha kirish gaplarsiz to'g'ridan-to'g'ri javob ber.
 - Muhim joylarga mos emojilar qo'y (masalan 💡 ⚡ ✅ 📌 🚀), lekin me'yorida.
@@ -57,15 +67,25 @@ function mdToHtml(md) {
   });
 
   t = escapeHtml(t)
-    .replace(/^\s{0,3}#{1,6}\s+(.+)$/gm, "<b>$1</b>") // # sarlavha
-    .replace(/^(\s*)[*-]\s+/gm, "$1• ") // * element -> • element
-    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>") // **qalin**
+    .replace(/^\s{0,3}#{1,6}\s+(.+)$/gm, "<b>$1</b>")
+    .replace(/^(\s*)[*-]\s+/gm, "$1• ")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
     .replace(/__(.+?)__/g, "<b>$1</b>")
-    .replace(/(^|[^*\w])\*(?![\s*])([^*\n]+?)\*(?![*\w])/g, "$1<i>$2</i>"); // *kursiv*
+    .replace(/(^|[^*\w])\*(?![\s*])([^*\n]+?)\*(?![*\w])/g, "$1<i>$2</i>");
 
   return t
     .replace(/\u0001(\d+)\u0001/g, (_, i) => inlines[i])
     .replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[i]);
+}
+
+// Ovoz uchun: barcha belgilarni olib tashlab, faqat toza matn qoldiradi
+function stripForSpeech(text) {
+  return text
+    .replace(/```[\s\S]*?```/g, " kod bloki ")
+    .replace(/[*_`#>•]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, 1800); // juda uzun bo'lmasin
 }
 
 function splitMessage(text, limit = 3500) {
@@ -80,7 +100,6 @@ function splitMessage(text, limit = 3500) {
   return parts;
 }
 
-// HTML bilan yuboradi, xato bo'lsa oddiy matn qilib yuboradi
 async function sendFormatted(ctx, text) {
   try {
     return await ctx.reply(mdToHtml(text), { parse_mode: "HTML" });
@@ -109,6 +128,57 @@ function trimHistory(history) {
   while (history.length && history[0].role !== "user") history.shift();
 }
 
+// ---------- Ovoz: PCM -> Telegram OGG/Opus ----------
+function pcmToOggVoice(pcmBuffer, sampleRate = 24000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const input = new PassThrough();
+    input.end(pcmBuffer);
+
+    ffmpeg(input)
+      .inputFormat("s16le")
+      .inputOptions([`-ar ${sampleRate}`, "-ac 1"])
+      .audioCodec("libopus")
+      .format("ogg")
+      .on("error", reject)
+      .on("end", () => resolve(Buffer.concat(chunks)))
+      .pipe()
+      .on("data", (chunk) => chunks.push(chunk))
+      .on("error", reject);
+  });
+}
+
+// Matnni Gemini TTS orqali ovozga aylantiradi, Telegram voice uchun tayyor Buffer qaytaradi
+async function synthesizeSpeech(text) {
+  const clean = stripForSpeech(text);
+  if (!clean) return null;
+
+  const response = await ai.models.generateContent({
+    model: TTS_MODEL,
+    contents: [{ role: "user", parts: [{ text: clean }] }],
+    config: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE_NAME } },
+      },
+    },
+  });
+
+  const inline = response.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
+  if (!inline?.data) return null;
+
+  const pcm = Buffer.from(inline.data, "base64");
+  return pcmToOggVoice(pcm, 24000);
+}
+
+async function downloadTelegramFile(fileId) {
+  const file = await bot.api.getFile(fileId);
+  const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
+  const res = await fetch(url);
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
 // ---------- Bot ----------
 bot.use(async (ctx, next) => {
   if (ALLOWED.length && !ALLOWED.includes(String(ctx.from?.id))) {
@@ -119,7 +189,7 @@ bot.use(async (ctx, next) => {
 
 bot.command("start", (ctx) =>
   ctx.reply(
-    "👋 Salom! Men AI yordamchiman.\nXohlagan savolingizni yozing, tezda javob beraman.\n\n🔄 /reset — suhbatni yangidan boshlash"
+    "👋 Salom! Men AI yordamchiman.\nMatn yozing yoki ovozli xabar yuboring — ikkalasiga ham javob beraman.\n\n🔄 /reset — suhbatni yangidan boshlash"
   )
 );
 
@@ -128,6 +198,7 @@ bot.command("reset", (ctx) => {
   return ctx.reply("🧹 Suhbat tozalandi. Yangi savol bering!");
 });
 
+// ----- Matnli xabarlar -----
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   if (busy.has(chatId)) {
@@ -153,7 +224,6 @@ bot.on("message:text", async (ctx) => {
 
     for await (const chunk of stream) {
       full += chunk.text ?? "";
-      // Javob yozilayotganda xabarni ~1.2 soniyada yangilab turamiz
       if (full.trim() && Date.now() - lastEdit > 1200) {
         lastEdit = Date.now();
         await editFormatted(ctx, placeholder.message_id, full.slice(0, 3500) + " ▌");
@@ -180,7 +250,65 @@ bot.on("message:text", async (ctx) => {
   }
 });
 
+// ----- Ovozli xabarlar -----
+bot.on(["message:voice", "message:audio"], async (ctx) => {
+  const chatId = ctx.chat.id;
+  if (busy.has(chatId)) {
+    return ctx.reply("⏳ Oldingi savolingizga javob tayyorlanmoqda, biroz kuting...");
+  }
+  busy.add(chatId);
+
+  const placeholder = await ctx.reply("🎙 Ovozli xabarni tinglayapman...");
+
+  try {
+    const fileId = ctx.message.voice?.file_id ?? ctx.message.audio?.file_id;
+    const audioBuffer = await downloadTelegramFile(fileId);
+    const audioBase64 = audioBuffer.toString("base64");
+
+    const history = histories.get(chatId) ?? [];
+    history.push({
+      role: "user",
+      parts: [{ inlineData: { mimeType: "audio/ogg", data: audioBase64 } }],
+    });
+    trimHistory(history);
+
+    const response = await ai.models.generateContent({
+      model: MODEL,
+      contents: history,
+      config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 1200 },
+    });
+
+    const answer = (response.text ?? "").trim() || "Kechirasiz, tushunolmadim. Qayta urinib ko'ring.";
+
+    history.push({ role: "model", parts: [{ text: answer }] });
+    trimHistory(history);
+    histories.set(chatId, history);
+
+    // Javobni matn ko'rinishida ko'rsatamiz
+    await editFormatted(ctx, placeholder.message_id, answer);
+
+    // Va ovozli xabar sifatida ham yuboramiz
+    await ctx.replyWithChatAction("record_voice").catch(() => {});
+    try {
+      const voiceBuffer = await synthesizeSpeech(answer);
+      if (voiceBuffer) {
+        await ctx.replyWithVoice(new InputFile(voiceBuffer, "javob.ogg"));
+      }
+    } catch (ttsErr) {
+      console.error("TTS xatosi:", ttsErr?.status, ttsErr?.message);
+      // Ovoz chiqmasa ham, matn javobi allaqachon yuborilgan, shuning uchun jim o'tamiz
+    }
+  } catch (err) {
+    console.error("Ovozli xabar xatosi:", err?.status, err?.message);
+    await ctx.api
+      .editMessageText(chatId, placeholder.message_id, "⚠️ Ovozli xabarni qayta ishlashda xatolik yuz berdi.")
+      .catch(() => {});
+  } finally {
+    busy.delete(chatId);
+  }
+});
+
 bot.catch((err) => console.error("Bot xatosi:", err.error ?? err));
 
 bot.start();
-console.log("AI bot ishga tushdi, model:", MODEL);
+console.log("AI bot ishga tushdi, model:", MODEL, "| TTS:", TTS_MODEL);

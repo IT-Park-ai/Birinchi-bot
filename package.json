@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-  "start": "node bot.js",
-  "dev": "node --env-file=.env bot.js"
-},
+    "start": "node bot.js",
+    "dev": "node --env-file=.env bot.js"
+  },
   "dependencies": {
     "@google/genai": "^1.0.0",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.3"
   }
 }
