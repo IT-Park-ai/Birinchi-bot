@@ -15,7 +15,39 @@ http
   .listen(PORT, () => console.log("HTTP server tinglamoqda:", PORT));
 
 const bot = new Bot(process.env.BOT_TOKEN);
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Bir nechta kalit: .env da GEMINI_API_KEYS=kalit1,kalit2,kalit3 (vergul bilan)
+// Yoki eski usulda bitta GEMINI_API_KEY ham ishlaydi.
+const API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
+if (API_KEYS.length === 0) {
+  throw new Error("GEMINI_API_KEY yoki GEMINI_API_KEYS .env da topilmadi!");
+}
+
+let keyIndex = 0;
+function currentClient() {
+  return new GoogleGenAI({ apiKey: API_KEYS[keyIndex] });
+}
+
+// Limit tugagan (429) xatoda keyingi kalitga o'tadi va so'rovni qayta yuboradi
+async function callWithRotation(fn) {
+  let lastErr;
+  for (let i = 0; i < API_KEYS.length; i++) {
+    try {
+      return await fn(currentClient());
+    } catch (err) {
+      lastErr = err;
+      const is429 = err?.status === 429 || String(err?.message).includes("429");
+      if (!is429) throw err; // 429 bo'lmasa, darhol xato qaytaramiz
+      console.log(`Kalit #${keyIndex + 1} limiti tugadi, keyingisiga o'tyapman...`);
+      keyIndex = (keyIndex + 1) % API_KEYS.length;
+    }
+  }
+  throw lastErr; // hamma kalit limiti tugagan
+}
 
 const MODEL = process.env.MODEL || "gemini-3.6-flash";
 // TTS (ovoz sintezi) uchun alohida model. AI Studio'da hozirgi nomini tekshiring.
@@ -153,16 +185,18 @@ async function synthesizeSpeech(text) {
   const clean = stripForSpeech(text);
   if (!clean) return null;
 
-  const response = await ai.models.generateContent({
-    model: TTS_MODEL,
-    contents: [{ role: "user", parts: [{ text: clean }] }],
-    config: {
-      responseModalities: ["AUDIO"],
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE_NAME } },
+  const response = await callWithRotation((ai) =>
+    ai.models.generateContent({
+      model: TTS_MODEL,
+      contents: [{ role: "user", parts: [{ text: clean }] }],
+      config: {
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE_NAME } },
+        },
       },
-    },
-  });
+    })
+  );
 
   const inline = response.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
   if (!inline?.data) return null;
@@ -213,11 +247,13 @@ bot.on("message:text", async (ctx) => {
   const placeholder = await ctx.reply("💭 O'ylayapman...");
 
   try {
-    const stream = await ai.models.generateContentStream({
-      model: MODEL,
-      contents: history,
-      config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 2000 },
-    });
+    const stream = await callWithRotation((ai) =>
+      ai.models.generateContentStream({
+        model: MODEL,
+        contents: history,
+        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 2000 },
+      })
+    );
 
     let full = "";
     let lastEdit = 0;
@@ -272,11 +308,13 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
     });
     trimHistory(history);
 
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: history,
-      config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 1200 },
-    });
+    const response = await callWithRotation((ai) =>
+      ai.models.generateContent({
+        model: MODEL,
+        contents: history,
+        config: { systemInstruction: SYSTEM_PROMPT, maxOutputTokens: 1200 },
+      })
+    );
 
     const answer = (response.text ?? "").trim() || "Kechirasiz, tushunolmadim. Qayta urinib ko'ring.";
 
