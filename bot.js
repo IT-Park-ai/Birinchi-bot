@@ -1,5 +1,13 @@
 import { Bot } from "grammy";
 import { GoogleGenAI } from "@google/genai";
+import http from "node:http";
+
+// Render "Web Service" turi portni kutadi. Botning o'ziga bu shart emas,
+// shuning uchun shu kichik server faqat Render'ni qanoatlantirish uchun.
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((_req, res) => res.end("Bot ishlayapti"))
+  .listen(PORT, () => console.log("HTTP server tinglamoqda:", PORT));
 
 const bot = new Bot(process.env.BOT_TOKEN);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
